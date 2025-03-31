@@ -1,5 +1,11 @@
 services:
-    - name: app
-      env: python
-      buildCommand: pip install -r requirements.txt
-      startCommand: uvicorn main:app --host 0.0.0.0 --port 80
+  - type: web
+    name: esco-backend
+    runtime: docker
+    dockerfile: Dockerfile
+    env: python
+    plan: standard
+    port: 10000  # Render's required port
+    envVars:
+      - key: PORT
+        value: 10000
