@@ -14,9 +14,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY . .
 
-# Production command (Gunicorn + Uvicorn)
-CMD ["gunicorn", "main:app", \
-     "--bind", "0.0.0.0:10000", \  # Render's default port
-     "--workers", "2", \
-     "--worker-class", "uvicorn.workers.UvicornWorker", \
-     "--timeout", "120"]
+# Production command (single line, no backslashes)
+CMD ["gunicorn", "main:app", "--bind", "0.0.0.0:10000", "--workers", "2", "--worker-class", "uvicorn.workers.UvicornWorker", "--timeout", "120"]
