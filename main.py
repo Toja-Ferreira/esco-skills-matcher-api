@@ -25,6 +25,10 @@ logging.basicConfig(
 # Initialize FastAPI app
 app = FastAPI(title="ESCO Skill Matcher API")
 
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,

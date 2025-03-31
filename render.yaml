@@ -5,7 +5,6 @@ services:
     dockerfile: Dockerfile
     env: python
     plan: standard
-    port: 10000  # Render's required port
     envVars:
       - key: PORT
         value: 10000
