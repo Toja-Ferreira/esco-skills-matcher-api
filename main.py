@@ -85,7 +85,7 @@ async def startup_event():
     load_dotenv()  # Load environment variables from .env file
     deepseek_utils = DeepseekUtils(
         processed_skills_path='./data/processed_skills.pkl',
-        api_key=os.environ("DEEPSEEK_API_KEY")
+        api_key=os.environ.get("DEEPSEEK_API_KEY")
     )
     logging.info("Deepseek initialized.")
     
@@ -258,4 +258,5 @@ async def analyze_course(course: CourseDescription):
         raise HTTPException(status_code=500, detail=f"Error processing input: {str(e)}")
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    port = int(os.environ.get("PORT", 10000))  # Default to Render's port
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
