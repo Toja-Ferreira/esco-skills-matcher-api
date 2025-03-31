@@ -28,7 +28,7 @@ app = FastAPI(title="ESCO Skill Matcher API")
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],  # Add your SvelteKit dev server
+    allow_origins=["http://localhost:5173", "https://esco-skills-matcher.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,7 +81,7 @@ async def startup_event():
     load_dotenv()  # Load environment variables from .env file
     deepseek_utils = DeepseekUtils(
         processed_skills_path='./data/processed_skills.pkl',
-        api_key=os.getenv("DEEPSEEK_API_KEY")
+        api_key=os.environ("DEEPSEEK_API_KEY")
     )
     logging.info("Deepseek initialized.")
     
