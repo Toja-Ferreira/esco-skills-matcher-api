@@ -19,6 +19,9 @@ import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
 from functools import lru_cache
 from thefuzz import fuzz
+import torch
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # Initialize NLTK resources quietly
 nltk.download('punkt', quiet=True)
@@ -122,7 +125,7 @@ class ESCOProcessor:
         Args:
             n_clusters: Number of clusters for skill grouping
         """
-        self.st_model = SentenceTransformer('all-mpnet-base-v2', device='cuda')
+        self.st_model = SentenceTransformer('all-mpnet-base-v2', device)
         self.kw_model = KeyBERT(model='all-mpnet-base-v2')
         self.n_clusters = n_clusters
         self.kmeans = None
