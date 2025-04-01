@@ -19,7 +19,7 @@ import nltk
 from sklearn.metrics.pairwise import cosine_similarity
 from utils import (
     FileUtils,
-    TextPreprocessor,
+    ESCOProcessor,
     KeywordUtils,
     EmbeddingUtils,
     DeepseekUtils,
@@ -100,12 +100,13 @@ class CourseDescription(BaseModel):
 class NLPResult(BaseModel):
     skill: str
     score: float
+    url: str = ""
 
 class AnalysisResponse(BaseModel):
     keywords: List[str]
     nlpResults: List[NLPResult]
-    llmResults: List[str]
-    hybridResults: List[str]
+    llmResults: List[Dict[str, str]]
+    hybridResults: List[Dict[str, str]]
 
 async def startup_event():
     """Initialize application state with memory optimizations"""
@@ -126,12 +127,12 @@ async def startup_event():
     # Load data with memory optimizations
     try:
         app_state.df = pd.read_pickle('./data/clustered_processed_skills.pkl')[
-            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'cluster']
+            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'cluster', 'conceptUri']
         ]
         app_state.has_clusters = True
     except FileNotFoundError:
         app_state.df = pd.read_pickle('./data/processed_skills.pkl')[
-            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings']
+            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'conceptUri']
         ]
         app_state.has_clusters = False
     
@@ -297,11 +298,26 @@ async def analyze_course(course: CourseDescription):
             fuzzy_threshold=80
         )
         
+        def get_skill_url(skill_name: str) -> str:
+            return ESCOProcessor.get_skill_url(app_state.df, skill_name)
+    
         return AnalysisResponse(
             keywords=keywords,
-            nlpResults=[NLPResult(skill=r["skill"], score=r["score"]) for r in final_nlp[:TOP_N_RESULTS]],
-            llmResults=llm_results[:TOP_N_RESULTS],
-            hybridResults=hybrid_results[:TOP_N_RESULTS]
+            nlpResults=[
+                NLPResult(
+                    skill=r["skill"], 
+                    score=r["score"],
+                    url=get_skill_url(r["skill"])  # Add URL
+                ) for r in final_nlp[:TOP_N_RESULTS]
+            ],
+            llmResults=[
+                {"skill": skill, "url": get_skill_url(skill)}
+                for skill in llm_results[:TOP_N_RESULTS]
+            ],
+            hybridResults=[
+                {"skill": skill, "url": get_skill_url(skill)}
+                for skill in hybrid_results[:TOP_N_RESULTS]
+            ]
         )
         
     except Exception as e:

@@ -196,6 +196,37 @@ class ESCOProcessor:
             embeddings.extend([batch_embeddings[j] for j in range(len(batch_embeddings))])
         
         return embeddings
+    
+    @staticmethod
+    def get_skill_url(df: pd.DataFrame, skill_name: str) -> str:
+        """
+        Search DataFrame for skill and return its ESCO URL
+        Args:
+            df: Loaded DataFrame from PKL
+            skill_name: Skill name to look up
+        Returns:
+            ESCO URL string or empty string if not found
+        """
+        try:
+            # First try exact match with preferredLabel
+            exact_match = df[df['preferredLabel'].str.lower() == skill_name.lower()]
+            if not exact_match.empty:
+                uri = exact_match.iloc[0]['conceptUri']
+                return uri  # Return the full URI from conceptUri column
+            
+            # Then try altLabels if exists (comma-separated)
+            if 'altLabels' in df.columns:
+                for _, row in df.iterrows():
+                    if pd.notna(row['altLabels']):
+                        alt_labels = [label.strip().lower() for label in str(row['altLabels']).split(',')]
+                        if skill_name.lower() in alt_labels:
+                            return row['conceptUri']
+            
+            return ""  # Return empty if no match found
+            
+        except Exception as e:
+            logging.error(f"URL lookup failed for {skill_name}: {str(e)}")
+            return ""
 
 class KeywordUtils:
     """Keyword extraction and processing utilities"""
