@@ -10,17 +10,20 @@ from dotenv import load_dotenv
 from thefuzz import process, fuzz
 from sentence_transformers import SentenceTransformer
 from keybert import KeyBERT
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import uvicorn
 import gc
 import psutil
 from contextlib import asynccontextmanager
 import nltk
+from sklearn.metrics.pairwise import cosine_similarity
 from utils import (
     FileUtils,
+    TextPreprocessor,
     KeywordUtils,
     EmbeddingUtils,
-    DeepseekUtils
+    DeepseekUtils,
+    NLPSkillFinder
 )
 
 # Configure logging
@@ -43,16 +46,21 @@ class AppState:
         if cls.__instance is None:
             cls.__instance = super().__new__(cls)
             cls.__instance.initialized = False
-        return cls.__instance
+            return cls.__instance
+    
+    def __init__(self):
+        if not hasattr(self, 'initialized'):
+            self.initialized = False
     
     def initialize(self):
         if not self.initialized:
             self.st_model = None
             self.kw_model = None
-            self.file_utils = None
-            self.keyword_utils = None
-            self.embedding_utils = None
+            self.file_utils = FileUtils()
+            self.keyword_utils = KeywordUtils()
+            self.embedding_utils = EmbeddingUtils()
             self.deepseek_utils = None
+            self.nlp_skill_finder = None
             self.df = None
             self.label_to_indices = {}
             self.has_clusters = False
@@ -103,13 +111,13 @@ async def startup_event():
     """Initialize application state with memory optimizations"""
     app_state.initialize()
     
-    # Initialize utilities
-    app_state.file_utils = FileUtils()
-    app_state.keyword_utils = KeywordUtils()
-    app_state.embedding_utils = EmbeddingUtils()
+    # Load models
+    load_models_if_needed()
+    
+    # Load environment variables
+    load_dotenv()
     
     # Initialize Deepseek
-    load_dotenv()
     app_state.deepseek_utils = DeepseekUtils(
         processed_skills_path='./data/processed_skills.pkl',
         api_key=os.environ.get("DEEPSEEK_API_KEY", "")
@@ -127,9 +135,8 @@ async def startup_event():
         ]
         app_state.has_clusters = False
     
-    # Reduce embedding size
-    if 'embeddings' in app_state.df.columns:
-        app_state.df['embeddings'] = app_state.df['embeddings']
+    # Initialize NLP Skill Finder
+    app_state.nlp_skill_finder = NLPSkillFinder(app_state.df)
     
     # Build label index
     for idx, row in app_state.df.iterrows():
@@ -169,136 +176,143 @@ def load_models_if_needed():
 
 @app.post("/analyze", response_model=AnalysisResponse)
 async def analyze_course(course: CourseDescription):
-    """Analyze course description with memory management"""
+    """Analyze course description with strict quality thresholds"""
     if not course.text.strip():
-        raise HTTPException(status_code=400, detail="Course description is required")
-    
-    if get_memory_usage() > 0.85:  # 85% memory threshold
-        raise HTTPException(
-            status_code=503,
-            detail="Service temporarily unavailable due to high memory usage"
-        )
+        raise HTTPException(status_code=400, detail="Empty input")
     
     try:
-        # Lazy load models
-        load_models_if_needed()
+        # Initialize thresholds (adjust these as needed)
+        MIN_SIMILARITY = 0.5   # 50% similarity minimum
+        FUZZY_CUTOFF = 75      # 75/100 fuzzy match minimum
+        TOP_N_RESULTS = 10     # Max results per method
         
-        # Process input with memory cleanup
-        try:
-            keywords = app_state.keyword_utils.extract_keywords(
-                course.text, 
-                app_state.kw_model, 
-                top_n=10
+        # 1. Keyword Extraction
+        keywords = KeywordUtils.extract_keywords(
+            course.text, 
+            app_state.kw_model, 
+            top_n=10,
+            diversity=0.7  # More diverse keywords
+        )
+        
+        # 2. Generate Embedding
+        embedding = EmbeddingUtils.compute_embeddings(
+            course.text, 
+            app_state.st_model,
+            preprocess=True
+        )
+        
+        # 3. Strict Fuzzy Matching
+        fuzzy_results = []
+        for keyword in keywords:
+            matches = process.extractBests(
+                keyword,
+                list(app_state.label_to_indices.keys()),
+                scorer=fuzz.token_set_ratio,
+                score_cutoff=FUZZY_CUTOFF,
+                limit=30  # More candidates for strict filtering
             )
-            embedding = app_state.embedding_utils.compute_embeddings(
-                course.text, 
-                app_state.st_model
-            )  # Reduced dimension
-            
-            # Fuzzy matching
-            fuzzy_matches = []
-            for keyword in keywords:
-                matches = process.extractBests(
-                    keyword,
-                    list(app_state.label_to_indices.keys()),
-                    scorer=fuzz.token_set_ratio,
-                    score_cutoff=app_state.fuzzy_cutoff,
-                    limit=50
-                )
-                fuzzy_matches.extend(matches)
-
-            # Process results with memory efficiency
-            nlp_results = process_fuzzy_matches(fuzzy_matches, embedding)
-            llm_results = await get_llm_results(course.text)
-            hybrid_results = await get_hybrid_results(course.text, nlp_results)
-            
-            return AnalysisResponse(
-                keywords=keywords,
-                nlpResults=[NLPResult(skill=r["skill"], score=r["score"]) for r in nlp_results],
-                llmResults=llm_results if llm_results else [],
-                hybridResults=hybrid_results if hybrid_results else []
-            )
-        finally:
-            gc.collect()
-    except Exception as e:
-        logging.error(f"Error analyzing course: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error processing input: {str(e)}")
-
-def process_fuzzy_matches(fuzzy_matches, embedding):
-    """Process fuzzy matches with memory efficiency"""
-    fuzzy_results = []
-    for match_text, match_score in fuzzy_matches:
-        if match_text.lower() in app_state.label_to_indices:
-            for idx in app_state.label_to_indices[match_text.lower()]:
+            for match_text, match_score in matches:
+                for idx in app_state.label_to_indices[match_text.lower()]:
+                    row = app_state.df.iloc[idx]
+                    sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
+                    if sim >= MIN_SIMILARITY:
+                        fuzzy_results.append({
+                            "skill": row['preferredLabel'],
+                            "score": round(sim * 100, 2),
+                            "match_score": match_score,
+                            "source": "fuzzy"
+                        })
+        
+        # 4. High-Quality Semantic Matching
+        similarities = cosine_similarity([embedding], np.vstack(app_state.df['embeddings']))[0]
+        semantic_results = []
+        for idx in np.argsort(similarities)[-100:][::-1]:  # Check top 100
+            score = similarities[idx]
+            if score >= MIN_SIMILARITY:
                 row = app_state.df.iloc[idx]
-                sim = app_state.embedding_utils.calculate_similarity(
-                    embedding, 
-                    row['embeddings']
-                )
-                if sim >= app_state.similarity_threshold:
-                    fuzzy_results.append({
-                        'preferredLabel': row.get('preferredLabel', 'N/A'),
-                        'similarity': sim,
-                        'fuzzy_score': match_score,
-                        'cluster': row.get('cluster', -1)
-                    })
-
-    # Process and deduplicate results
-    nlp_results = []
-    seen_skills = set()
-    
-    if fuzzy_results:
-        results_df = pd.DataFrame(fuzzy_results)
-        results_df = results_df.sort_values(
-            by=['similarity', 'fuzzy_score'],
-            ascending=[False, False]
-        ).drop_duplicates('preferredLabel')
-        
-        for _, row in results_df.head(10).iterrows():
-            if row['preferredLabel'] not in seen_skills:
-                nlp_results.append({
+                semantic_results.append({
                     "skill": row['preferredLabel'],
-                    "score": float(row['similarity'])
+                    "score": round(score * 100, 2),
+                    "source": "semantic"
                 })
-                seen_skills.add(row['preferredLabel'])
-    
-    return nlp_results
-
-async def get_llm_results(text: str):
-    """Get LLM results with error handling"""
-    try:
-        return await app_state.deepseek_utils.get_pure_recommendations(
-            teacher_input=text,
-            max_results=10,
-            fuzzy_threshold=70
-        )
-    except Exception as e:
-        logging.error(f"Error getting LLM results: {str(e)}")
-        return []
-
-async def get_hybrid_results(text: str, nlp_results: List[Dict]):
-    """Get hybrid results with memory efficiency"""
-    if not app_state.has_clusters or not nlp_results:
-        return []
-    
-    try:
-        # Get cluster skills
-        candidate_skills = {res['skill'] for res in nlp_results}
-        result_clusters = {res['cluster'] for res in nlp_results if res.get('cluster', -1) != -1}
+                if len(semantic_results) >= TOP_N_RESULTS:
+                    break
         
-        for cluster_id in result_clusters:
-            cluster_skills = app_state.df[app_state.df['cluster'] == cluster_id]['preferredLabel'].head(3)
-            candidate_skills.update(cluster_skills.tolist())
+        # 5. Cluster-Augmented Results (if available)
+        cluster_results = []
+        if app_state.has_clusters and (fuzzy_results or semantic_results):
+            # Get clusters from ALL valid results
+            result_clusters = set()
+            
+            # Check fuzzy results (if any)
+            for res in fuzzy_results:
+                if 'cluster' in res and res['cluster'] != -1:
+                    result_clusters.add(res['cluster'])
+            
+            # Check semantic results (if any)
+            for res in semantic_results:
+                # Find the skill in dataframe to get its cluster
+                skill_rows = app_state.df[app_state.df['preferredLabel'] == res['skill']]
+                if not skill_rows.empty:
+                    cluster_id = skill_rows.iloc[0]['cluster']
+                    if cluster_id != -1:
+                        result_clusters.add(cluster_id)
+            
+            # Get skills from relevant clusters
+            for cluster_id in result_clusters:
+                cluster_skills = app_state.df[app_state.df['cluster'] == cluster_id]
+                for _, row in cluster_skills.iterrows():
+                    sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
+                    if sim >= MIN_SIMILARITY:
+                        cluster_results.append({
+                            "skill": row['preferredLabel'],
+                            "score": round(sim * 100, 2),
+                            "source": f"cluster_{cluster_id}"
+                        })
         
-        return await app_state.deepseek_utils.get_hybrid_recommendations(
-            teacher_input=text,
-            nlp_cluster_skills=list(candidate_skills)[:10],  # Limited input size
-            max_results=5,  # Reduced from 10
-            fuzzy_threshold=0
+        # 6. Combine and Strictly Filter Results
+        combined = fuzzy_results + semantic_results + cluster_results
+            
+        seen = set()
+        final_nlp = []
+        
+        for res in sorted(combined, key=lambda x: x["score"], reverse=True):
+            skill = res["skill"]
+            if skill not in seen:
+                seen.add(skill)
+                final_nlp.append(res)
+                if len(final_nlp) >= TOP_N_RESULTS * 2:  # Allow more for LLM
+                    break
+        
+        # 7. LLM Processing with Quality Control
+        llm_results = await app_state.deepseek_utils.get_pure_recommendations(
+            input_text=course.text,
+            max_results=TOP_N_RESULTS,
+            fuzzy_threshold=80
         )
+        
+        # 8. Hybrid Approach with Curated Input
+        candidate_skills = {res["skill"] for res in final_nlp}
+        hybrid_results = await app_state.deepseek_utils.get_hybrid_recommendations(
+            input_text=course.text,
+            nlp_results=list(candidate_skills),
+            max_results=TOP_N_RESULTS,
+            fuzzy_threshold=80
+        )
+        
+        return AnalysisResponse(
+            keywords=keywords,
+            nlpResults=[NLPResult(skill=r["skill"], score=r["score"]) for r in final_nlp[:TOP_N_RESULTS]],
+            llmResults=llm_results[:TOP_N_RESULTS],
+            hybridResults=hybrid_results[:TOP_N_RESULTS]
+        )
+        
     except Exception as e:
-        logging.error(f"Error getting hybrid results: {str(e)}")
-        return []
+        logging.error(f"Analysis failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Skill analysis failed - please try again"
+        )
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))

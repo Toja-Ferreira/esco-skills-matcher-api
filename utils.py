@@ -9,9 +9,10 @@ from nltk.stem import WordNetLemmatizer
 from keybert import KeyBERT
 from sentence_transformers import SentenceTransformer
 from collections import defaultdict
-from typing import List, Dict, Optional, Union
+from typing import List, Dict, Optional, Union, Tuple
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
 from tqdm import tqdm
 import httpx
 import logging
@@ -114,11 +115,18 @@ class FileUtils:
 class ESCOProcessor:
     """Combined ESCO data processing functionality"""
     
-    def __init__(self):
-        """Initialize with models"""
+    def __init__(self, n_clusters: int = 50):
+        """
+        Initialize with models
+        
+        Args:
+            n_clusters: Number of clusters for skill grouping
+        """
         self.st_model = SentenceTransformer('all-mpnet-base-v2', device='cuda')
         self.kw_model = KeyBERT(model='all-mpnet-base-v2')
-    
+        self.n_clusters = n_clusters
+        self.kmeans = None
+        
     @staticmethod
     def combine_text_fields(row: pd.Series) -> str:
         """Combine all relevant text fields from an ESCO skill row"""
@@ -142,9 +150,16 @@ class ESCOProcessor:
 
     def process_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         """Run full preprocessing pipeline on a DataFrame"""
+        # Process text and extract features
         df['combined_text'] = df.apply(self.combine_text_fields, axis=1)
         df['skill_keywords'] = self._extract_keywords_batch(df['combined_text'])
         df['embeddings'] = self._generate_embeddings(df['combined_text'])
+        
+        # Cluster skills based on embeddings
+        embeddings_array = np.vstack(df['embeddings'].values)
+        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42)
+        df['cluster'] = self.kmeans.fit_predict(embeddings_array)
+        
         return df
     
     def _extract_keywords_batch(self, texts: pd.Series) -> List[List[str]]:
@@ -234,6 +249,35 @@ class KeywordUtils:
             for kws in skill_keywords
         ]
 
+    @staticmethod
+    def keyword_similarity(query: str, skill_keywords: List[List[str]]) -> List[Tuple[int, float]]:
+        """
+        Compare query to skill keywords using fuzzy matching
+        Returns: List of (skill_index, score) tuples
+        """
+        query_tokens = set(TextPreprocessor.preprocess_for_keywords(query).split())
+        results = []
+        
+        for i, keywords in enumerate(skill_keywords):
+            if not keywords:
+                results.append((i, 0.0))
+                continue
+                
+            # Calculate best token match scores
+            match_scores = []
+            for token in query_tokens:
+                best_score = max(
+                    (fuzz.ratio(token, kw) for kw in keywords),
+                    default=0
+                )
+                match_scores.append(best_score / 100.0)  # Normalize to 0-1
+                
+            # Average the scores
+            avg_score = sum(match_scores) / len(match_scores) if match_scores else 0
+            results.append((i, avg_score))
+            
+        return sorted(results, key=lambda x: x[1], reverse=True)
+
 class EmbeddingUtils:
     """Embedding-related utilities"""
     
@@ -259,10 +303,94 @@ class EmbeddingUtils:
     @staticmethod
     def batch_similarity(
         query_embedding: np.ndarray,
-        embeddings: np.ndarray
-    ) -> np.ndarray:
-        """Calculate similarities for a batch of embeddings"""
-        return cosine_similarity([query_embedding], embeddings)[0]
+        embeddings: List[np.ndarray]
+    ) -> List[Tuple[int, float]]:
+        """
+        Calculate similarities for a batch of embeddings
+        Returns: List of (index, similarity_score) tuples
+        """
+        similarities = []
+        embeddings_array = np.vstack(embeddings)
+        scores = cosine_similarity([query_embedding], embeddings_array)[0]
+        
+        for i, score in enumerate(scores):
+            similarities.append((i, float(score)))
+            
+        return sorted(similarities, key=lambda x: x[1], reverse=True)
+
+class NLPSkillFinder:
+    """Combined NLP approach for skill recommendation"""
+    
+    def __init__(self, df: pd.DataFrame, model_path: str = 'all-mpnet-base-v2'):
+        """
+        Initialize with processed DataFrame
+        
+        Args:
+            df: DataFrame with processed skills (must have embeddings, keywords, cluster)
+            model_path: SentenceTransformer model path
+        """
+        self.df = df
+        self.model = SentenceTransformer(model_path, device='cuda')
+        
+    def find_skills(
+        self, 
+        query: str, 
+        top_n: int = 20,
+        embedding_weight: float = 0.5,
+        keyword_weight: float = 0.3,
+        cluster_weight: float = 0.2
+    ) -> List[str]:
+        """
+        Find skills using combined NLP approaches
+        
+        Args:
+            query: User query string
+            top_n: Number of skills to return
+            embedding_weight: Weight for embedding similarity
+            keyword_weight: Weight for keyword similarity
+            cluster_weight: Weight for cluster membership
+            
+        Returns:
+            List of relevant skill names
+        """
+        # 1. Get embedding similarity scores
+        query_embedding = EmbeddingUtils.compute_embeddings(query, self.model)
+        embedding_results = EmbeddingUtils.batch_similarity(
+            query_embedding, 
+            self.df['embeddings'].tolist()
+        )
+        
+        # 2. Get keyword similarity scores
+        keyword_results = KeywordUtils.keyword_similarity(
+            query, 
+            self.df['skill_keywords'].tolist()
+        )
+        
+        # 3. Determine most relevant clusters
+        top_indices = [idx for idx, _ in embedding_results[:50]]
+        cluster_counts = self.df.iloc[top_indices]['cluster'].value_counts()
+        relevant_clusters = set(cluster_counts.nlargest(3).index.tolist())
+        
+        # 4. Compute combined scores
+        combined_scores = {}
+        for i in range(len(self.df)):
+            emb_score = next((score for idx, score in embedding_results if idx == i), 0)
+            kw_score = next((score for idx, score in keyword_results if idx == i), 0)
+            cluster_score = 1.0 if self.df.iloc[i]['cluster'] in relevant_clusters else 0.0
+            
+            # Weighted combination
+            combined_scores[i] = (
+                embedding_weight * emb_score +
+                keyword_weight * kw_score +
+                cluster_weight * cluster_score
+            )
+        
+        # 5. Get top skills
+        top_indices = sorted(combined_scores.keys(), 
+                           key=lambda idx: combined_scores[idx], 
+                           reverse=True)[:top_n]
+        
+        return self.df.iloc[top_indices]['preferredLabel'].tolist()
 
 class DeepseekUtils:
     """Ultra-optimized ESCO recommender with fuzzy matching and runtime validation"""
@@ -292,8 +420,10 @@ class DeepseekUtils:
         
         # Extract all skill name variations
         skills = set(df['preferredLabel'].dropna())
-        skills.update(df['altLabels'].explode().dropna())
-        skills.update(df['hiddenLabels'].explode().dropna())
+        if 'altLabels' in df.columns:
+            skills.update(df['altLabels'].explode().dropna())
+        if 'hiddenLabels' in df.columns:
+            skills.update(df['hiddenLabels'].explode().dropna())
         return skills
 
     def _build_case_insensitive_index(self) -> Dict[str, str]:
@@ -333,11 +463,14 @@ class DeepseekUtils:
             "messages": [
                 {
                     "role": "system",
-                    "content": """You are a strict ESCO taxonomy expert specializing in programming skills. 
-                    Rules:
-                    1. Only recommend skills actually relevant to the request
-                    2. Never recommend obscure/unrelated technologies 
-                    3. Maintain exact ESCO skill names"""
+                    "content": """You are an ESCO taxonomy expert specializing in skills classification.
+                    
+                    Your tasks:
+                    1. Identify relevant skills from the ESCO framework
+                    2. RANK skills from most to least relevant
+                    3. REMOVE any skills that are not applicable
+                    4. Maintain exact ESCO skill names
+                    5. Consider all possible domains including technical, soft, and domain-specific skills"""
                 },
                 {"role": "user", "content": prompt}
             ],
@@ -356,19 +489,27 @@ class DeepseekUtils:
 
     async def get_pure_recommendations(
         self,
-        teacher_input: str,
+        input_text: str,
         max_results: int = 10,
         fuzzy_threshold: int = 85
     ) -> List[str]:
         """
-        Mode 1: Teacher input only with fuzzy validation
+        Mode 1: User input only with fuzzy validation
         Args:
+            input_text: User request for skills
             fuzzy_threshold: 0-100 similarity score (0=exact match only)
         """
-        prompt = f"""Return up to {max_results} official ESCO skills for: "{teacher_input}"
+        prompt = f"""Analyze this request and identify the most relevant skills from the ESCO framework:
+        
+        Request: "{input_text}"
+        
+        Return up to {max_results} official ESCO skills that best match this request.
+        
         Requirements:
-        - ONLY exact ESCO skill names
-        - JSON format: {{"skills": ["skill1", ...]}}
+        - ONLY return exact ESCO skill names
+        - RANK from most to least relevant
+        - Focus on both domain-specific and transferable skills
+        - JSON format: {{"skills": ["most_relevant_skill", "second_most", ...]}}
         """
         
         response = await self._query_deepseek(prompt)
@@ -376,42 +517,40 @@ class DeepseekUtils:
 
     async def get_hybrid_recommendations(
         self,
-        teacher_input: str,
-        nlp_cluster_skills: List[str],
+        input_text: str,
+        nlp_results: List[str],
         max_results: int = 10,
         fuzzy_threshold: int = 0
     ) -> List[str]:
         """
-        Improved Mode 2: Teacher input + NLP context with smarter filtering
+        Improved Mode 2: Pass all NLP results to LLM for re-ranking
+        
+        Args:
+            input_text: User query
+            nlp_results: Results from NLP approach
+            max_results: Maximum results to return
+            fuzzy_threshold: Fuzzy matching threshold for validation
         """
-        # Step 1: Pre-filter skills by relevance to input
-        input_lower = teacher_input.lower()
-        filtered_skills = [
-            skill for skill in nlp_cluster_skills 
-            if ("python" in input_lower and "python" in skill.lower()) or
-            fuzz.partial_ratio(input_lower, skill.lower()) > 60
-        ]
+        prompt = f"""From these ESCO skills:
+        {json.dumps(nlp_results, indent=2)}
         
-        # Step 2: Limit to top 50 most relevant skills to avoid overwhelming LLM
-        filtered_skills = sorted(
-            filtered_skills,
-            key=lambda x: fuzz.token_set_ratio(input_lower, x.lower()),
-            reverse=True
-        )[:10]
+        Select and rank the most relevant skills for this request: "{input_text}"
         
-        prompt = f"""From these programming skills related to {teacher_input}:
-        {json.dumps(filtered_skills, indent=2)}
+        Instructions:
+        1. RANK skills from most to least relevant for the request
+        2. REMOVE any skills that are not applicable or relevant
+        3. Consider both technical and non-technical aspects
+        4. Maximum {max_results} skills in your response
         
-        Select the top {max_results} most specifically relevant skills.
-        Rules:
-        1. Prioritize skills mentioning "Python" explicitly
-        2. Then consider general programming concepts
-        3. Exclude completely unrelated technologies
-        4. JSON format: {{"skills": ["skill1", ...]}}
+        JSON format: {{"skills": ["most_relevant_skill", "second_most_relevant", ...]}}
         """
         
         response = await self._query_deepseek(prompt)
-        return self._parse_response(response, context_skills=filtered_skills, fuzzy_threshold=fuzzy_threshold)
+        return self._parse_response(
+            response,
+            fuzzy_threshold=fuzzy_threshold,  # Validates against ESCO
+            max_results=max_results
+        )
 
     def _parse_response(
         self,
