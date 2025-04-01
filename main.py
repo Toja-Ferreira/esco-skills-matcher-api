@@ -270,7 +270,6 @@ async def analyze_course(course: CourseDescription):
         
         # 6. Combine and Strictly Filter Results
         combined = fuzzy_results + semantic_results + cluster_results
-        combined = [res for res in combined if res["score"] >= MIN_SIMILARITY]
         seen = set()
         final_nlp = []
         
