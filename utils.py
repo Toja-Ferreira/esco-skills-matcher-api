@@ -333,7 +333,7 @@ class NLPSkillFinder:
             model_path: SentenceTransformer model path
         """
         self.df = df
-        self.model = SentenceTransformer(model_path, device='cuda')
+        self.model = SentenceTransformer(model_path)
         
     def find_skills(
         self, 
