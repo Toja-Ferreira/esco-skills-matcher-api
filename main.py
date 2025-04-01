@@ -182,7 +182,7 @@ async def analyze_course(course: CourseDescription):
     
     try:
         # Initialize thresholds (adjust these as needed)
-        MIN_SIMILARITY = 0.5   # 50% similarity minimum
+        MIN_SIMILARITY = 50   # 50% similarity minimum
         FUZZY_CUTOFF = 75      # 75/100 fuzzy match minimum
         TOP_N_RESULTS = 10     # Max results per method
         
@@ -215,28 +215,26 @@ async def analyze_course(course: CourseDescription):
                 for idx in app_state.label_to_indices[match_text.lower()]:
                     row = app_state.df.iloc[idx]
                     sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
-                    if sim >= MIN_SIMILARITY:
-                        fuzzy_results.append({
-                            "skill": row['preferredLabel'],
-                            "score": round(sim * 100, 2),
-                            "match_score": match_score,
-                            "source": "fuzzy"
-                        })
+                    fuzzy_results.append({
+                        "skill": row['preferredLabel'],
+                        "score": round(sim * 100, 2),
+                        "match_score": match_score,
+                        "source": "fuzzy"
+                    })
         
         # 4. High-Quality Semantic Matching
         similarities = cosine_similarity([embedding], np.vstack(app_state.df['embeddings']))[0]
         semantic_results = []
         for idx in np.argsort(similarities)[-100:][::-1]:  # Check top 100
             score = similarities[idx]
-            if score >= MIN_SIMILARITY:
-                row = app_state.df.iloc[idx]
-                semantic_results.append({
-                    "skill": row['preferredLabel'],
-                    "score": round(score * 100, 2),
-                    "source": "semantic"
-                })
-                if len(semantic_results) >= TOP_N_RESULTS:
-                    break
+            row = app_state.df.iloc[idx]
+            semantic_results.append({
+                "skill": row['preferredLabel'],
+                "score": round(score * 100, 2),
+                "source": "semantic"
+            })
+            if len(semantic_results) >= TOP_N_RESULTS:
+                break
         
         # 5. Cluster-Augmented Results (if available)
         cluster_results = []
@@ -263,16 +261,15 @@ async def analyze_course(course: CourseDescription):
                 cluster_skills = app_state.df[app_state.df['cluster'] == cluster_id]
                 for _, row in cluster_skills.iterrows():
                     sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
-                    if sim >= MIN_SIMILARITY:
-                        cluster_results.append({
-                            "skill": row['preferredLabel'],
-                            "score": round(sim * 100, 2),
-                            "source": f"cluster_{cluster_id}"
-                        })
+                    cluster_results.append({
+                        "skill": row['preferredLabel'],
+                        "score": round(sim * 100, 2),
+                        "source": f"cluster_{cluster_id}"
+                    })
         
         # 6. Combine and Strictly Filter Results
         combined = fuzzy_results + semantic_results + cluster_results
-            
+        combined = [res for res in combined if res["score"] >= MIN_SIMILARITY]
         seen = set()
         final_nlp = []
         

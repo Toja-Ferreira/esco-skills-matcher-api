@@ -534,16 +534,15 @@ class DeepseekUtils:
             max_results: Maximum results to return
             fuzzy_threshold: Fuzzy matching threshold for validation
         """
-        prompt = f"""From these ESCO skills:
+        prompt = f"""Course Description: "{input_text}"
+        
+        Analyze this course description and identify the most relevant skills from this list:
         {json.dumps(nlp_results, indent=2)}
         
-        Select and rank the most relevant skills for this request: "{input_text}"
-        
         Instructions:
-        1. RANK skills from most to least relevant for the request
-        2. REMOVE any skills that are not applicable or relevant
-        3. Consider both technical and non-technical aspects
-        4. Maximum {max_results} skills in your response
+        1. RANK skills from most to least relevant for the course description
+        2. REMOVE any skills that are not applicable or relevant to the course description
+        3. FOCUS on both domain-specific and transferable skills
         
         JSON format: {{"skills": ["most_relevant_skill", "second_most_relevant", ...]}}
         """
