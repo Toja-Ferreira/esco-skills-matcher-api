@@ -18,7 +18,7 @@ import httpx
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
 from functools import lru_cache
-from thefuzz import fuzz
+from thefuzz import fuzz, process
 import torch
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -235,22 +235,34 @@ class KeywordUtils:
     def extract_keywords(
         text: str, 
         model: KeyBERT,
-        top_n: int = 10,
-        ngram_range: tuple = (1, 2),
-        diversity: float = 0.6
+        top_n: int = 18,
+        ngram_range: tuple = (1, 3)
     ) -> List[str]:
-        """Extract keywords with reduced redundancy"""
+        """
+        Extract meaningful multi-word phrases as keywords
+        Returns:
+            List of keywords sorted by relevance (score desc, then length desc)
+        """
         preprocessed = TextPreprocessor.preprocess_for_keywords(text)
         keywords = model.extract_keywords(
             preprocessed,
             keyphrase_ngram_range=ngram_range,
             stop_words='english',
-            use_mmr=True,
-            diversity=diversity,
-            top_n=top_n*2
+            use_mmr=False,
+            top_n=top_n*2  # Get more candidates for filtering
         )
-        raw_keywords = [kw[0] for kw in keywords]
-        return KeywordUtils.deduplicate_keywords(raw_keywords)[:top_n]
+        
+        # Filter and prioritize multi-word phrases
+        filtered = []
+        for kw, score in keywords:
+            words = kw.split()
+            # Prefer longer phrases (2-3 words) over single words
+            if len(words) > 1:
+                filtered.append((kw, score * (1 + 0.2*len(words))))
+        
+        # Sort by adjusted score descending, then phrase length descending
+        filtered_sorted = sorted(filtered, key=lambda x: (-x[1], -len(x[0].split())))
+        return [kw for kw, _ in filtered_sorted][:top_n]
 
     @staticmethod
     def deduplicate_keywords(keywords: List[str]) -> List[str]:
@@ -286,29 +298,58 @@ class KeywordUtils:
     @staticmethod
     def keyword_similarity(query: str, skill_keywords: List[List[str]]) -> List[Tuple[int, float]]:
         """
-        Compare query to skill keywords using fuzzy matching
-        Returns: List of (skill_index, score) tuples
-        """
-        query_tokens = set(TextPreprocessor.preprocess_for_keywords(query).split())
-        results = []
+        Compare query to pre-calculated skill keywords (mostly bi-grams)
+        Returns: List of (skill_index, score) tuples sorted by relevance
         
-        for i, keywords in enumerate(skill_keywords):
-            if not keywords:
-                results.append((i, 0.0))
+        Args:
+            query: Input text to match against skills
+            skill_keywords: List of keyword lists (one per skill)
+            
+        Process:
+        1. Extract bi-grams from query using same method as skill keywords
+        2. For each skill's keywords:
+           - Find best fuzzy match for each query keyword
+           - Score matches above 65% similarity threshold
+           - Weight scores by match quality and keyword length
+        3. Normalize scores by number of query keywords
+        4. Return sorted results by descending score
+        """
+        if not skill_keywords:
+            return []
+
+        # Extract bi-grams from query using same method as skill keywords
+        query_keywords = KeywordUtils.extract_keywords(
+            query,
+            KeyBERT(SentenceTransformer('all-mpnet-base-v2')),
+            top_n=15,
+            ngram_range=(2, 2)  # Focus only on bi-grams to match skill_keywords format
+        )
+        
+        if not query_keywords:
+            return []
+            
+        results = []
+        for i, skill_kws in enumerate(skill_keywords):
+            if not skill_kws:
                 continue
                 
-            # Calculate best token match scores
-            match_scores = []
-            for token in query_tokens:
-                best_score = max(
-                    (fuzz.ratio(token, kw) for kw in keywords),
-                    default=0
+            # Calculate overlap between query bi-grams and skill bi-grams
+            overlap_score = 0.0
+            for q_kw in query_keywords:
+                # Find best matching skill keyword
+                best_match = process.extractOne(
+                    q_kw.lower(),
+                    [sk_kw.lower() for sk_kw in skill_kws],
+                    scorer=fuzz.token_sort_ratio
                 )
-                match_scores.append(best_score / 100.0)  # Normalize to 0-1
-                
-            # Average the scores
-            avg_score = sum(match_scores) / len(match_scores) if match_scores else 0
-            results.append((i, avg_score))
+                if best_match and best_match[1] >= 65:  # Minimum 65% match
+                    # Weight by match quality and keyword length
+                    overlap_score += best_match[1] * (1 + len(q_kw.split())/10.0)
+            
+            if overlap_score > 0:
+                # Normalize by number of query keywords
+                normalized_score = overlap_score / len(query_keywords)
+                results.append((i, float(normalized_score)))
             
         return sorted(results, key=lambda x: x[1], reverse=True)
 
@@ -366,14 +407,122 @@ class NLPSkillFinder:
         self.df = df
         self.model = SentenceTransformer(model_path)
         
+    def _analyze_query(self, query: str) -> dict:
+        """Analyze query text features for dynamic weighting"""
+        features = {
+            'length': len(query),
+            'word_count': len(query.split()),
+            'keyword_density': len(KeywordUtils.extract_keywords(query, KeyBERT(self.model))) / max(1, len(query.split()))
+        }
+        return features
+        
+    def _get_dynamic_weights(self, features: dict) -> dict:
+        """Determine weights based on query features"""
+        if features['length'] < 50:
+            return {'embedding': 0.4, 'keyword': 0.5, 'cluster': 0.1}
+        elif features['keyword_density'] > 0.3:
+            return {'embedding': 0.5, 'keyword': 0.4, 'cluster': 0.1}
+        else:
+            return {'embedding': 0.7, 'keyword': 0.2, 'cluster': 0.1}
+            
+    def _phase1_recall(self, query: str, top_n: int = 50) -> List[Tuple[int, float]]:
+        """Broad recall phase with relaxed thresholds"""
+        # Get embedding matches
+        query_embedding = EmbeddingUtils.compute_embeddings(query, self.model)
+        embedding_matches = EmbeddingUtils.batch_similarity(
+            query_embedding, 
+            self.df['embeddings'].tolist()
+        )[:top_n*2]
+        
+        # Get keyword matches
+        keyword_matches = KeywordUtils.keyword_similarity(
+            query, 
+            self.df['skill_keywords'].tolist()
+        )[:top_n*2]
+        
+        return embedding_matches, keyword_matches
+        
+    def _phase2_refine(self, candidates: List[int], query: str, weights: dict) -> List[Tuple[int, float]]:
+        """Precision refinement phase"""
+        refined = []
+        query_embedding = EmbeddingUtils.compute_embeddings(query, self.model)
+        
+        for idx in candidates:
+            row = self.df.iloc[idx]
+            emb_score = cosine_similarity(
+                [query_embedding],
+                [row['embeddings']]
+            )[0][0]
+            
+            kw_similarity = KeywordUtils.keyword_similarity(query, [row['skill_keywords']])
+            kw_score = max(kw_similarity[0][1] if kw_similarity else 0, 0)
+            
+            cluster_score = 1.0 if 'cluster' in row and row['cluster'] in self._get_relevant_clusters(query) else 0.0
+            
+            combined = (
+                weights['embedding'] * emb_score +
+                weights['keyword'] * kw_score +
+                weights.get('cluster', 0) * cluster_score
+            )
+            refined.append((idx, combined))
+            
+        return sorted(refined, key=lambda x: x[1], reverse=True)
+        
+    def _get_relevant_clusters(self, query: str, n_clusters: int = 3) -> set:
+        """Identify most relevant clusters for query"""
+        if not hasattr(self, 'cluster_centers_'):
+            # Get cluster centers from KMeans if available in the dataframe
+            if 'cluster' in self.df.columns:
+                # Calculate cluster centers from embeddings
+                cluster_centers = []
+                for cluster_id in sorted(self.df['cluster'].unique()):
+                    cluster_embeddings = np.vstack(
+                        self.df[self.df['cluster'] == cluster_id]['embeddings'].values
+                    )
+                    cluster_centers.append(cluster_embeddings.mean(axis=0))
+                self.cluster_centers_ = cluster_centers
+            else:
+                # Fallback to empty set if no clusters available
+                return set()
+                
+        query_embedding = EmbeddingUtils.compute_embeddings(query, self.model)
+        similarities = [
+            (i, cosine_similarity([query_embedding], [center])[0][0])
+            for i, center in enumerate(self.cluster_centers_)
+        ]
+        return {i for i, _ in sorted(similarities, key=lambda x: x[1], reverse=True)[:n_clusters]}
+        
     def find_skills(
         self, 
         query: str, 
         top_n: int = 20,
-        embedding_weight: float = 0.5,
-        keyword_weight: float = 0.3,
-        cluster_weight: float = 0.2
+        embedding_weight: float = None,
+        keyword_weight: float = None,
+        cluster_weight: float = None
     ) -> List[str]:
+        """Two-phase skill finding with recall + refinement"""
+        # Phase 1: Broad recall
+        embedding_matches, keyword_matches = self._phase1_recall(query, top_n*3)
+        
+        # Combine and deduplicate candidates
+        candidate_indices = set()
+        for idx, _ in embedding_matches[:top_n*2]:
+            candidate_indices.add(idx)
+        for idx, _ in keyword_matches[:top_n*2]:
+            candidate_indices.add(idx)
+            
+        # Phase 2: Precision refinement
+        features = self._analyze_query(query)
+        weights = self._get_dynamic_weights(features)
+        refined = self._phase2_refine(list(candidate_indices), query, weights)
+        """Find skills with dynamic weighting based on query characteristics"""
+        # Set default weights if not provided
+        if embedding_weight is None or keyword_weight is None or cluster_weight is None:
+            features = self._analyze_query(query)
+            weights = self._get_dynamic_weights(features)
+            embedding_weight = weights['embedding']
+            keyword_weight = weights['keyword'] 
+            cluster_weight = weights.get('cluster', 0)
         """
         Find skills using combined NLP approaches
         
@@ -497,14 +646,17 @@ class DeepseekUtils:
             "messages": [
                 {
                     "role": "system",
-                    "content": """You are an ESCO taxonomy expert specializing in skills classification.
+                    "content": """You are an ESCO taxonomy expert specializing in skills classification across all domains.
                     
                     Your tasks:
                     1. Identify relevant skills from the ESCO framework
                     2. RANK skills from most to least relevant
                     3. REMOVE any skills that are not applicable
                     4. Maintain exact ESCO skill names
-                    5. Consider all possible domains including technical, soft, and domain-specific skills"""
+                    5. Also consider:
+                       - Transferable skills
+                       - Soft skills
+                       - Other domain-specific skills"""
                 },
                 {"role": "user", "content": prompt}
             ],
@@ -528,7 +680,7 @@ class DeepseekUtils:
         fuzzy_threshold: int = 85
     ) -> List[str]:
         """
-        Mode 1: User input only with fuzzy validation
+        Mode 1: User input only
         Args:
             input_text: User request for skills
             fuzzy_threshold: 0-100 similarity score (0=exact match only)
@@ -557,7 +709,7 @@ class DeepseekUtils:
         fuzzy_threshold: int = 0
     ) -> List[str]:
         """
-        Improved Mode 2: Pass all NLP results to LLM for re-ranking
+        Improved Mode 2: Pass user input + all NLP results to LLM for re-ranking
         
         Args:
             input_text: User query

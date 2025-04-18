@@ -14,6 +14,9 @@ from typing import List, Dict, Any, Optional, Tuple
 import uvicorn
 import gc
 import psutil
+import time
+import json
+from collections import defaultdict
 from contextlib import asynccontextmanager
 import nltk
 from sklearn.metrics.pairwise import cosine_similarity
@@ -23,7 +26,8 @@ from utils import (
     KeywordUtils,
     EmbeddingUtils,
     DeepseekUtils,
-    NLPSkillFinder
+    NLPSkillFinder,
+    TextPreprocessor
 )
 
 # Configure logging
@@ -54,19 +58,58 @@ class AppState:
     
     def initialize(self):
         if not self.initialized:
+            self._models_loaded = False
+            self._data_loaded = False
             self.st_model = None
             self.kw_model = None
-            self.file_utils = FileUtils()
-            self.keyword_utils = KeywordUtils()
-            self.embedding_utils = EmbeddingUtils()
+            self.file_utils = None
+            self.keyword_utils = None
+            self.embedding_utils = None
             self.deepseek_utils = None
             self.nlp_skill_finder = None
             self.df = None
             self.label_to_indices = {}
             self.has_clusters = False
-            self.similarity_threshold = 0.5
-            self.fuzzy_cutoff = 70
             self.initialized = True
+
+    def load_models(self):
+        if not hasattr(self, 'st_model'):
+            self.st_model = SentenceTransformer('all-mpnet-base-v2')
+            self.kw_model = KeyBERT(self.st_model)
+            self.file_utils = FileUtils()
+            self.keyword_utils = KeywordUtils()
+            self.embedding_utils = EmbeddingUtils()
+            self._models_loaded = True
+
+    def load_data(self):
+        if not hasattr(self, 'df'):
+            try:
+                self.df = pd.read_pickle('./data/clustered_processed_skills.pkl')[
+                    ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'skill_keywords', 'cluster', 'conceptUri']
+                ]
+                self.has_clusters = True
+            except FileNotFoundError:
+                self.df = pd.read_pickle('./data/processed_skills.pkl')[
+                    ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'skill_keywords', 'conceptUri']
+                ]
+                self.has_clusters = False
+            
+            self.label_to_indices = {}
+            for idx, row in self.df.iterrows():
+                labels = []
+                if pd.notnull(row['preferredLabel']):
+                    labels.append(row['preferredLabel'].lower())
+                if pd.notnull(row['altLabels']):
+                    labels.extend(label.strip().lower() for label in str(row['altLabels']).split(','))
+                if pd.notnull(row['hiddenLabels']):
+                    labels.extend(label.strip().lower() for label in str(row['hiddenLabels']).split(','))
+                
+                for label in labels:
+                    if label not in self.label_to_indices:
+                        self.label_to_indices[label] = []
+                    self.label_to_indices[label].append(idx)
+            
+            self._data_loaded = True
 
 app_state = AppState()
 
@@ -127,12 +170,12 @@ async def startup_event():
     # Load data with memory optimizations
     try:
         app_state.df = pd.read_pickle('./data/clustered_processed_skills.pkl')[
-            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'cluster', 'conceptUri']
+            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'skill_keywords', 'cluster', 'conceptUri']
         ]
         app_state.has_clusters = True
     except FileNotFoundError:
         app_state.df = pd.read_pickle('./data/processed_skills.pkl')[
-            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'conceptUri']
+            ['preferredLabel', 'altLabels', 'hiddenLabels', 'embeddings', 'skill_keywords', 'conceptUri']
         ]
         app_state.has_clusters = False
     
@@ -176,68 +219,128 @@ def load_models_if_needed():
         app_state.kw_model = KeyBERT(app_state.st_model)
 
 @app.post("/analyze", response_model=AnalysisResponse)
-async def analyze_course(course: CourseDescription):
+async def analyze_course(course: CourseDescription, request: Request):
     """Analyze course description with strict quality thresholds"""
     if not course.text.strip():
         raise HTTPException(status_code=400, detail="Empty input")
+        
+    # Initialize debug logging
+    debug_data = {
+        'input_text': course.text,
+        'timings': {},
+        'stages': {}
+    }
+    start_time = time.time()
     
     try:
         # Initialize thresholds (adjust these as needed)
         MIN_SIMILARITY = 50   # 50% similarity minimum
-        FUZZY_CUTOFF = 75      # 75/100 fuzzy match minimum
+        FUZZY_CUTOFF = 65      # Lower threshold for better recall
         TOP_N_RESULTS = 10     # Max results per method
-        
-        # 1. Keyword Extraction
-        keywords = KeywordUtils.extract_keywords(
-            course.text, 
-            app_state.kw_model, 
-            top_n=10,
-            diversity=0.7  # More diverse keywords
-        )
-        
+            
+        debug_data['parameters'] = {
+            'MIN_SIMILARITY': MIN_SIMILARITY,
+            'FUZZY_CUTOFF': FUZZY_CUTOFF,
+            'TOP_N_RESULTS': TOP_N_RESULTS
+        }
+    
+        # 1. Extract and filter keywords from query text
+        kw_start = time.time()
+        preprocessed = TextPreprocessor.preprocess_for_keywords(course.text)
+        # Filter out single characters/digits and keep only meaningful keywords
+        query_keywords = {
+            kw for kw in preprocessed.split() 
+            if len(kw) > 1 and not kw.isdigit()
+        }
+        all_skill_keywords = app_state.df['skill_keywords'].tolist()
+        debug_data['timings']['keyword_processing'] = time.time() - kw_start
+        debug_data['stages']['keywords'] = {
+            'query_keywords': list(query_keywords),
+            'total_skills': len(all_skill_keywords),
+            'sample_skill_keywords': all_skill_keywords[:3] if all_skill_keywords else []
+        }
+    
         # 2. Generate Embedding
+        emb_start = time.time()
         embedding = EmbeddingUtils.compute_embeddings(
             course.text, 
             app_state.st_model,
             preprocess=True
         )
-        
-        # 3. Strict Fuzzy Matching
+        debug_data['timings']['embedding_generation'] = time.time() - emb_start
+        debug_data['stages']['embedding'] = {
+            'dimensions': len(embedding),
+            'sample_values': embedding[:3].tolist()  # First 3 values as sample
+        }
+    
+        # 3. Match against pre-calculated skill keywords
+        fuzzy_start = time.time()
         fuzzy_results = []
-        for keyword in keywords:
-            matches = process.extractBests(
-                keyword,
-                list(app_state.label_to_indices.keys()),
-                scorer=fuzz.token_set_ratio,
-                score_cutoff=FUZZY_CUTOFF,
-                limit=30  # More candidates for strict filtering
-            )
-            for match_text, match_score in matches:
-                for idx in app_state.label_to_indices[match_text.lower()]:
-                    row = app_state.df.iloc[idx]
-                    sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
-                    fuzzy_results.append({
-                        "skill": row['preferredLabel'],
-                        "score": round(sim * 100, 2),
-                        "match_score": match_score,
-                        "source": "fuzzy"
-                    })
         
+        for idx, skill_keywords in enumerate(all_skill_keywords):
+            if not skill_keywords:
+                continue
+                
+            # Calculate best keyword match scores
+            match_scores = []
+            for query_kw in query_keywords:
+                best_score = max(
+                    (fuzz.ratio(query_kw, skill_kw) for skill_kw in skill_keywords),
+                    default=0
+                )
+                if best_score >= FUZZY_CUTOFF:
+                    match_scores.append(best_score / 100.0)  # Normalize to 0-1
+            
+            if match_scores:
+                avg_score = sum(match_scores) / len(match_scores)
+                row = app_state.df.iloc[idx]
+                sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
+                # Weight embeddings 50% and keywords 50%
+                combined_score = round((0.5 * avg_score + 0.5 * sim) * 100, 2)
+                fuzzy_results.append({
+                    "skill": row['preferredLabel'],
+                    "score": combined_score,
+                    "keyword_match": round(avg_score * 100, 2),
+                    "embedding_sim": round(sim * 100, 2),
+                    "source": "skill_keywords"
+                })
+        
+        debug_data['timings']['fuzzy_matching'] = time.time() - fuzzy_start
+        debug_data['stages']['fuzzy_matching'] = {
+            'total_matches': len(fuzzy_results),
+            'sample_matches': fuzzy_results[:3] if fuzzy_results else []
+        }
+    
         # 4. High-Quality Semantic Matching
+        semantic_start = time.time()
         similarities = cosine_similarity([embedding], np.vstack(app_state.df['embeddings']))[0]
         semantic_results = []
-        for idx in np.argsort(similarities)[-100:][::-1]:  # Check top 100
+        top_indices = np.argsort(similarities)[-100:][::-1]  # Check top 100
+        for idx in top_indices:
             score = similarities[idx]
             row = app_state.df.iloc[idx]
-            semantic_results.append({
+            result = {
                 "skill": row['preferredLabel'],
                 "score": round(score * 100, 2),
                 "source": "semantic"
-            })
+            }
+            semantic_results.append(result)
             if len(semantic_results) >= TOP_N_RESULTS:
                 break
         
+        debug_data['timings']['semantic_matching'] = time.time() - semantic_start
+        debug_data['stages']['semantic_matching'] = {
+            'top_scores': [r['score'] for r in semantic_results],
+            'skills_found': [r['skill'] for r in semantic_results],
+            'similarity_range': {
+                'min': float(similarities.min()),
+                'max': float(similarities.max()),
+                'mean': float(similarities.mean())
+            }
+        }
+    
         # 5. Cluster-Augmented Results (if available)
+        cluster_start = time.time()
         cluster_results = []
         if app_state.has_clusters and (fuzzy_results or semantic_results):
             # Get clusters from ALL valid results
@@ -245,30 +348,45 @@ async def analyze_course(course: CourseDescription):
             
             # Check fuzzy results (if any)
             for res in fuzzy_results:
-                if 'cluster' in res and res['cluster'] != -1:
-                    result_clusters.add(res['cluster'])
-            
-            # Check semantic results (if any)
-            for res in semantic_results:
-                # Find the skill in dataframe to get its cluster
                 skill_rows = app_state.df[app_state.df['preferredLabel'] == res['skill']]
                 if not skill_rows.empty:
                     cluster_id = skill_rows.iloc[0]['cluster']
                     if cluster_id != -1:
                         result_clusters.add(cluster_id)
             
-            # Get skills from relevant clusters
-            for cluster_id in result_clusters:
-                cluster_skills = app_state.df[app_state.df['cluster'] == cluster_id]
-                for _, row in cluster_skills.iterrows():
-                    sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
-                    cluster_results.append({
-                        "skill": row['preferredLabel'],
-                        "score": round(sim * 100, 2),
-                        "source": f"cluster_{cluster_id}"
-                    })
+            # Check semantic results (if any)
+            for res in semantic_results:
+                skill_rows = app_state.df[app_state.df['preferredLabel'] == res['skill']]
+                if not skill_rows.empty:
+                    cluster_id = skill_rows.iloc[0]['cluster']
+                    if cluster_id != -1:
+                        result_clusters.add(cluster_id)
         
+            # Get skills from relevant clusters
+            cluster_skills = []
+            for cluster_id in result_clusters:
+                cluster_skills.extend(
+                    app_state.df[app_state.df['cluster'] == cluster_id]
+                    .to_dict('records')
+                )
+            
+            for row in cluster_skills:
+                sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
+                cluster_results.append({
+                    "skill": row['preferredLabel'],
+                    "score": round(sim * 100, 2),
+                    "source": f"cluster_{row['cluster']}"
+                })
+        
+        debug_data['timings']['cluster_processing'] = time.time() - cluster_start
+        debug_data['stages']['cluster_results'] = {
+            'clusters_used': list(result_clusters) if app_state.has_clusters else [],
+            'skills_from_clusters': [r['skill'] for r in cluster_results],
+            'cluster_match_count': len(cluster_results)
+        }
+    
         # 6. Combine and Strictly Filter Results
+        combine_start = time.time()
         combined = fuzzy_results + semantic_results + cluster_results
         seen = set()
         final_nlp = []
@@ -281,14 +399,33 @@ async def analyze_course(course: CourseDescription):
                 if len(final_nlp) >= TOP_N_RESULTS * 2:  # Allow more for LLM
                     break
         
+        debug_data['timings']['result_combination'] = time.time() - combine_start
+        debug_data['stages']['combined_results'] = {
+            'total_candidates': len(combined),
+            'unique_skills': len(seen),
+            'final_candidates': [r['skill'] for r in final_nlp],
+            'score_range': {
+                'min': min(r['score'] for r in final_nlp) if final_nlp else 0,
+                'max': max(r['score'] for r in final_nlp) if final_nlp else 0,
+                'avg': sum(r['score'] for r in final_nlp)/len(final_nlp) if final_nlp else 0
+            }
+        }
+    
         # 7. LLM Processing with Quality Control
+        llm_start = time.time()
         llm_results = await app_state.deepseek_utils.get_pure_recommendations(
             input_text=course.text,
             max_results=TOP_N_RESULTS,
             fuzzy_threshold=80
         )
+        debug_data['timings']['llm_processing'] = time.time() - llm_start
+        debug_data['stages']['llm_results'] = {
+            'skills_returned': llm_results,
+            'count': len(llm_results)
+        }
         
         # 8. Hybrid Approach with Curated Input
+        hybrid_start = time.time()
         candidate_skills = {res["skill"] for res in final_nlp}
         hybrid_results = await app_state.deepseek_utils.get_hybrid_recommendations(
             input_text=course.text,
@@ -296,12 +433,76 @@ async def analyze_course(course: CourseDescription):
             max_results=TOP_N_RESULTS,
             fuzzy_threshold=80
         )
+        debug_data['timings']['hybrid_processing'] = time.time() - hybrid_start
+        debug_data['stages']['hybrid_results'] = {
+            'input_candidates': len(candidate_skills),
+            'final_skills': hybrid_results,
+            'new_skills_added': len(set(hybrid_results) - candidate_skills)
+        }
         
+        # Detailed analysis logging
+        total_time = time.time() - start_time
+        logging.info(f"\n=== Analysis Report ===")
+        logging.info(f"Completed in {total_time:.2f}s")
+        
+        # Keyword matching details
+        logging.info(f"\nQuery keywords ({len(query_keywords)}):")
+        for kw in query_keywords:
+            matches = [m['skill'] for m in fuzzy_results if kw.lower() in m['skill'].lower()]
+            logging.info(f"- '{kw}': Matched {len(matches)} skills")
+            if matches:
+                logging.info(f"  Sample matches: {matches[:3]}")
+
+        # Top matches breakdown
+        logging.info("\nTop 5 NLP Matches (Score Breakdown):")
+        for i, match in enumerate(final_nlp[:5], 1):
+            logging.info(f"{i}. {match['skill']} (Score: {match['score']:.1f})")
+            logging.info(f"   Source: {match['source']}")
+            if 'match_score' in match:
+                logging.info(f"   Keyword match: {match['match_score']}%")
+
+        # Cluster influence analysis
+        if app_state.has_clusters:
+            logging.info("\n=== Cluster Analysis ===")
+            cluster_stats = defaultdict(lambda: {'count': 0, 'skills': []})
+            
+            # Analyze top 10 results
+            for match in final_nlp[:10]:
+                skill_rows = app_state.df[app_state.df['preferredLabel'] == match['skill']]
+                if not skill_rows.empty:
+                    cluster_id = skill_rows.iloc[0]['cluster']
+                    cluster_stats[cluster_id]['count'] += 1
+                    cluster_stats[cluster_id]['skills'].append(match['skill'])
+            
+            # Log cluster distribution
+            logging.info("Cluster Distribution in Top 10 Results:")
+            for cluster_id, stats in sorted(cluster_stats.items(), 
+                                         key=lambda x: x[1]['count'], 
+                                         reverse=True):
+                logging.info(f"- Cluster {cluster_id}: {stats['count']} skills")
+                logging.info(f"  Sample skills: {stats['skills'][:3]}")
+            
+            # Check for cluster dominance
+            dominant_cluster = max(cluster_stats.items(), key=lambda x: x[1]['count'])
+            if dominant_cluster[1]['count'] > 5:  # More than half from one cluster
+                logging.warning(f"Cluster {dominant_cluster[0]} dominates results - consider reviewing cluster composition")
+
+        # LLM reasoning
+        logging.info("\nLLM Analysis:")
+        logging.info(f"- Pure LLM recommendations: {llm_results[:5]}")
+        logging.info(f"- Hybrid recommendations: {hybrid_results[:5]}")
+        if set(llm_results) - set([r['skill'] for r in final_nlp]):
+            logging.info("LLM added new skills not found by NLP methods")
+
+        logging.info("\nFinal Top Recommendations:")
+        for i, skill in enumerate(hybrid_results[:5], 1):
+            logging.info(f"{i}. {skill}")
+    
         def get_skill_url(skill_name: str) -> str:
             return ESCOProcessor.get_skill_url(app_state.df, skill_name)
     
         return AnalysisResponse(
-            keywords=keywords,
+            keywords=list(query_keywords),
             nlpResults=[
                 NLPResult(
                     skill=r["skill"], 
