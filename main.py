@@ -146,9 +146,7 @@ class NLPResult(BaseModel):
     url: str = ""
 
 class AnalysisResponse(BaseModel):
-    keywords: List[str]
     nlpResults: List[NLPResult]
-    llmResults: List[Dict[str, str]]
     hybridResults: List[Dict[str, str]]
 
 async def startup_event():
@@ -234,8 +232,8 @@ async def analyze_course(course: CourseDescription, request: Request):
     
     try:
         # Initialize thresholds (adjust these as needed)
-        MIN_SIMILARITY = 50   # 50% similarity minimum
-        FUZZY_CUTOFF = 65      # Lower threshold for better recall
+        MIN_SIMILARITY = 50    # 50% similarity minimum
+        FUZZY_CUTOFF = 90      #
         TOP_N_RESULTS = 10     # Max results per method
             
         debug_data['parameters'] = {
@@ -246,12 +244,13 @@ async def analyze_course(course: CourseDescription, request: Request):
     
         # 1. Extract and filter keywords from query text
         kw_start = time.time()
-        preprocessed = TextPreprocessor.preprocess_for_keywords(course.text)
-        # Filter out single characters/digits and keep only meaningful keywords
-        query_keywords = {
-            kw for kw in preprocessed.split() 
-            if len(kw) > 1 and not kw.isdigit()
-        }
+        query_keywords = KeywordUtils.extract_keywords(
+            course.text,
+            app_state.kw_model,
+            top_n=30,
+            ngram_range=(2, 2)       # bi-grams only, same as skill side
+        )
+        
         all_skill_keywords = app_state.df['skill_keywords'].tolist()
         debug_data['timings']['keyword_processing'] = time.time() - kw_start
         debug_data['stages']['keywords'] = {
@@ -273,37 +272,44 @@ async def analyze_course(course: CourseDescription, request: Request):
             'sample_values': embedding[:3].tolist()  # First 3 values as sample
         }
     
-        # 3. Match against pre-calculated skill keywords
         fuzzy_start = time.time()
-        fuzzy_results = []
-        
-        for idx, skill_keywords in enumerate(all_skill_keywords):
-            if not skill_keywords:
-                continue
-                
-            # Calculate best keyword match scores
-            match_scores = []
-            for query_kw in query_keywords:
+        candidate_map   = {}                # idx → kw_strength
+        keyword_hits    = defaultdict(list) # kw_string → list[idx]
+
+
+        for query_kw in query_keywords:                       # outer loop: query bigrams
+            for idx, skill_kws in enumerate(all_skill_keywords):
+                if not skill_kws: 
+                    continue
+
                 best_score = max(
-                    (fuzz.ratio(query_kw, skill_kw) for skill_kw in skill_keywords),
-                    default=0
+                    fuzz.token_sort_ratio(query_kw, sk_kw)    # strict bi-gram match
+                    for sk_kw in skill_kws
                 )
                 if best_score >= FUZZY_CUTOFF:
-                    match_scores.append(best_score / 100.0)  # Normalize to 0-1
-            
-            if match_scores:
-                avg_score = sum(match_scores) / len(match_scores)
-                row = app_state.df.iloc[idx]
-                sim = cosine_similarity([embedding], [row['embeddings']])[0][0]
-                # Weight embeddings 50% and keywords 50%
-                combined_score = round((0.5 * avg_score + 0.5 * sim) * 100, 2)
-                fuzzy_results.append({
-                    "skill": row['preferredLabel'],
-                    "score": combined_score,
-                    "keyword_match": round(avg_score * 100, 2),
-                    "embedding_sim": round(sim * 100, 2),
-                    "source": "skill_keywords"
-                })
+                    kw_strength = best_score / 100.0
+                    # keep strongest
+                    candidate_map[idx] = max(candidate_map.get(idx, 0.0), kw_strength)
+                    keyword_hits[query_kw].append(idx)
+
+
+        # ---------------------------------------------------------------------
+        # 4.  For *only* those candidates, compute cosine & blended score
+        # ---------------------------------------------------------------------
+        fuzzy_results = []
+
+        for idx, kw_strength in candidate_map.items():
+            row = app_state.df.iloc[idx]
+            sim = cosine_similarity([embedding], [row['embeddings']])[0][0]    # 0-1
+            blended = 0.8 * sim + 0.2 * kw_strength
+
+            fuzzy_results.append({
+                "skill":         row['preferredLabel'],
+                "score":         round(blended * 100, 2),
+                "embedding_sim": round(sim * 100, 2),
+                "kw_strength":   round(kw_strength*100, 2),
+                "source":        "keyword+cosine"
+            })
         
         debug_data['timings']['fuzzy_matching'] = time.time() - fuzzy_start
         debug_data['stages']['fuzzy_matching'] = {
@@ -395,9 +401,8 @@ async def analyze_course(course: CourseDescription, request: Request):
             skill = res["skill"]
             if skill not in seen:
                 seen.add(skill)
-                final_nlp.append(res)
-                if len(final_nlp) >= TOP_N_RESULTS * 2:  # Allow more for LLM
-                    break
+                if res["score"] >= MIN_SIMILARITY:
+                    final_nlp.append(res)
         
         debug_data['timings']['result_combination'] = time.time() - combine_start
         debug_data['stages']['combined_results'] = {
@@ -409,19 +414,6 @@ async def analyze_course(course: CourseDescription, request: Request):
                 'max': max(r['score'] for r in final_nlp) if final_nlp else 0,
                 'avg': sum(r['score'] for r in final_nlp)/len(final_nlp) if final_nlp else 0
             }
-        }
-    
-        # 7. LLM Processing with Quality Control
-        llm_start = time.time()
-        llm_results = await app_state.deepseek_utils.get_pure_recommendations(
-            input_text=course.text,
-            max_results=TOP_N_RESULTS,
-            fuzzy_threshold=80
-        )
-        debug_data['timings']['llm_processing'] = time.time() - llm_start
-        debug_data['stages']['llm_results'] = {
-            'skills_returned': llm_results,
-            'count': len(llm_results)
         }
         
         # 8. Hybrid Approach with Curated Input
@@ -445,17 +437,17 @@ async def analyze_course(course: CourseDescription, request: Request):
         logging.info(f"\n=== Analysis Report ===")
         logging.info(f"Completed in {total_time:.2f}s")
         
-        # Keyword matching details
         logging.info(f"\nQuery keywords ({len(query_keywords)}):")
         for kw in query_keywords:
-            matches = [m['skill'] for m in fuzzy_results if kw.lower() in m['skill'].lower()]
-            logging.info(f"- '{kw}': Matched {len(matches)} skills")
-            if matches:
-                logging.info(f"  Sample matches: {matches[:3]}")
+            idxs = keyword_hits.get(kw, [])
+            logging.info(f"- '{kw}': Matched {len(idxs)} skills")
+            if idxs:
+                sample = [app_state.df.iloc[i]['preferredLabel'] for i in idxs]
+                logging.info(f"  Sample matches: {sample}")
 
         # Top matches breakdown
-        logging.info("\nTop 5 NLP Matches (Score Breakdown):")
-        for i, match in enumerate(final_nlp[:5], 1):
+        logging.info("\nNLP Matches (Score Breakdown):")
+        for i, match in enumerate(final_nlp, 1):
             logging.info(f"{i}. {match['skill']} (Score: {match['score']:.1f})")
             logging.info(f"   Source: {match['source']}")
             if 'match_score' in match:
@@ -489,30 +481,24 @@ async def analyze_course(course: CourseDescription, request: Request):
 
         # LLM reasoning
         logging.info("\nLLM Analysis:")
-        logging.info(f"- Pure LLM recommendations: {llm_results[:5]}")
-        logging.info(f"- Hybrid recommendations: {hybrid_results[:5]}")
-        if set(llm_results) - set([r['skill'] for r in final_nlp]):
+        logging.info(f"- Hybrid recommendations: {hybrid_results[:10]}")
+        if set(hybrid_results) - set([r['skill'] for r in final_nlp]):
             logging.info("LLM added new skills not found by NLP methods")
 
         logging.info("\nFinal Top Recommendations:")
-        for i, skill in enumerate(hybrid_results[:5], 1):
+        for i, skill in enumerate(hybrid_results[:10], 1):
             logging.info(f"{i}. {skill}")
     
         def get_skill_url(skill_name: str) -> str:
             return ESCOProcessor.get_skill_url(app_state.df, skill_name)
     
         return AnalysisResponse(
-            keywords=list(query_keywords),
             nlpResults=[
                 NLPResult(
                     skill=r["skill"], 
                     score=r["score"],
                     url=get_skill_url(r["skill"])  # Add URL
                 ) for r in final_nlp[:TOP_N_RESULTS]
-            ],
-            llmResults=[
-                {"skill": skill, "url": get_skill_url(skill)}
-                for skill in llm_results[:TOP_N_RESULTS]
             ],
             hybridResults=[
                 {"skill": skill, "url": get_skill_url(skill)}

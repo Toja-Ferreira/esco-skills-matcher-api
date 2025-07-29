@@ -256,9 +256,7 @@ class KeywordUtils:
         filtered = []
         for kw, score in keywords:
             words = kw.split()
-            # Prefer longer phrases (2-3 words) over single words
-            if len(words) > 1:
-                filtered.append((kw, score * (1 + 0.2*len(words))))
+            filtered.append((kw, score * (1 + 0.2*len(words))))
         
         # Sort by adjusted score descending, then phrase length descending
         filtered_sorted = sorted(filtered, key=lambda x: (-x[1], -len(x[0].split())))
