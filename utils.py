@@ -783,3 +783,182 @@ class DeepseekUtils:
         except (KeyError, json.JSONDecodeError) as e:
             logging.error(f"Response parsing failed: {e}")
             return []
+
+# ---------------------------
+# Teaching methods (INLINE)
+# ---------------------------
+from typing import Any
+
+# 1) Your small, curated list (from your PDF excerpt)
+ALLOWED_TEACHING_METHODS = [
+    # Teacher-Centered
+    {
+        "method_name": "Direct Instruction",
+        "category": "Teacher-Centered",
+        "snippet": "Teachers convey knowledge mainly via lectures and scripted lesson plans; typically low-tech (texts/workbooks)."
+    },
+    {
+        "method_name": "Flipped Classrooms",
+        "category": "Teacher-Centered",
+        "snippet": "Students watch/read lessons at home and do assignments/problem-solving in class."
+    },
+    {
+        "method_name": "Kinesthetic Learning",
+        "category": "Teacher-Centered",
+        "snippet": "Hands-on physical activities; values movement/creativity; often augments traditional instruction."
+    },
+
+    # Student-Centered
+    {
+        "method_name": "Differentiated Instruction",
+        "category": "Student-Centered",
+        "snippet": "Instruction tailored to how each student learns best; options for accessing content, activities, assessment, classroom setup."
+    },
+    {
+        "method_name": "Inquiry-Based Learning",
+        "category": "Student-Centered",
+        "snippet": "Teacher as guide; students take active/participatory role working on projects."
+    },
+    {
+        "method_name": "Expeditionary Learning",
+        "category": "Student-Centered",
+        "snippet": "Learning outside classroom (community/nature/civic sites) for real-world experiences; tech may augment."
+    },
+    {
+        "method_name": "Personalized Learning",
+        "category": "Student-Centered",
+        "snippet": "Self-directed plans aligned to interests/skills; individualized assessment and pacing with ongoing review."
+    },
+    {
+        "method_name": "Game-Based Learning",
+        "category": "Student-Centered",
+        "snippet": "Problem-solving quests; students earn points/badges; teachers may use classroom gaming software."
+    },
+
+    # Blended & UDL
+    {
+        "method_name": "Blended Learning",
+        "category": "Blended",
+        "snippet": "Mix of online instruction and in-class teaching; emphasizes flexibility and choice by learning style."
+    },
+    {
+        "method_name": "Universal Design for Learning",
+        "category": "UDL",
+        "snippet": "Framework to teach every student via multiple intelligences/modalities in general classroom."
+    },
+]
+
+# 2) Deterministic, JSON-only inline agent
+class DeepseekTeachingInline:
+    """
+    No index. No external file. Uses a small, curated, inline list of methods.
+    Deterministic (temperature=0). Validates output against whitelist.
+    """
+    PROMPT = """Use ONLY the ALLOWED methods and CONTEXT below.
+
+                ALLOWED METHODS (name → category):
+                {allowed}
+
+                CONTEXT (short definitions you may quote as evidence):
+                {context}
+
+                TASK:
+                From the ALLOWED METHODS, select those that best match the USER_COURSE_DESCRIPTION.
+
+                RULES:
+                - Choose ONLY from ALLOWED METHODS.
+                - Return STRICT JSON with this schema:
+                {{
+                "methods": [
+                    {{
+                    "method_name": "string",   // exact name from ALLOWED
+                    "category": "string",      // exact category from ALLOWED
+                    "evidence": "string",      // a short phrase or sentence quoted or paraphrased from CONTEXT that shows why this method is relevant
+                    "why_use_it": "string"     // 1–2 sentences in plain language explaining why this method matches the USER_COURSE_DESCRIPTION
+                    }},
+                    ...
+                ]
+                }}
+                - "evidence" MUST come from the CONTEXT text above. Do not invent new evidence.
+                - "why_use_it" should connect the USER_COURSE_DESCRIPTION to the method (e.g., mentioning practical activities, personalization, technology, etc.).
+                - Do not invent new methods, categories, or fields.
+                - Keep output minimal: JSON only, no explanations outside the JSON.
+
+                USER_COURSE_DESCRIPTION:
+                {user_text}
+                """
+    def __init__(self, deepseek, methods: Optional[List[Dict[str, Any]]] = None):
+        self.deepseek = deepseek
+        self.items = methods if methods is not None else ALLOWED_TEACHING_METHODS
+        self.whitelist = {it["method_name"] for it in self.items}
+        self.by_name = {it["method_name"]: it for it in self.items}
+
+    def _normalize_method_name(self, name: str) -> Optional[str]:
+        """Strip suffixes like '(Teacher-Centered)' and map to whitelist if possible."""
+        if not name:
+            return None
+        # remove trailing category in parentheses, e.g. "Direct Instruction (Teacher-Centered)"
+        base = name.split("(")[0].strip()
+        for allowed in self.whitelist:
+            if allowed.lower() == base.lower():
+                return allowed
+        return None
+
+    async def recommend(self, user_text: str, top_k: int = 5) -> dict:
+        # build the prompt
+        prompt = self.PROMPT.format(
+            allowed="\n".join(f"- {it['method_name']} ({it['category']})" for it in self.items),
+            context="\n".join(f"- {it['method_name']} ({it['category']}): {it['snippet']}"
+                              for it in self.items if it.get("snippet")),
+            user_text=user_text
+        )
+
+        logging.info("DeepSeek PROMPT:\n%s", prompt)
+
+        # query deepseek
+        raw = await self.deepseek._query_deepseek(prompt)
+        try:
+            raw_content = raw["choices"][0]["message"]["content"]
+        except Exception as e:
+            logging.error(f"DeepSeek returned no content: {e}")
+            return {"methods": []}
+
+        logging.info("DeepSeek RAW RESPONSE:\n%s", raw_content)
+
+        # parse json
+        try:
+            data = json.loads(raw_content)
+        except Exception as e:
+            logging.error(f"JSON parse failed: {e}")
+            return {"methods": []}
+
+        # post-process
+        out = []
+        for m in data.get("methods", []):
+            norm = self._normalize_method_name(m.get("method_name"))
+            if not norm:
+                continue
+
+            item = self.by_name[norm]
+            m["method_name"] = norm
+            m["category"] = item["category"]
+
+            name = m.get("method_name", "")
+            if name in self.whitelist:
+                # ensure category matches curated one
+                m["category"] = item["category"]
+
+                # fallback evidence
+                ev = (m.get("evidence") or "").strip()
+                if not ev:
+                    ev = item.get("snippet", "").strip() or "Not in source"
+                m["evidence"] = ev
+
+                # cleanup why_use_it
+                m["why_use_it"] = (m.get("why_use_it") or "").strip()
+
+                out.append(m)
+                if len(out) >= top_k:
+                    break
+
+        return {"methods": out}

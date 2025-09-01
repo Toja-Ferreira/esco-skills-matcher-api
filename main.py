@@ -27,7 +27,8 @@ from utils import (
     EmbeddingUtils,
     DeepseekUtils,
     NLPSkillFinder,
-    TextPreprocessor
+    TextPreprocessor,
+    DeepseekTeachingInline
 )
 
 # Configure logging
@@ -58,6 +59,7 @@ class AppState:
     
     def initialize(self):
         if not self.initialized:
+            self.tm_agent = None
             self._models_loaded = False
             self._data_loaded = False
             self.st_model = None
@@ -195,6 +197,14 @@ async def startup_event():
                 app_state.label_to_indices[label] = []
             app_state.label_to_indices[label].append(idx)
     
+    # --- Teaching methods (inline, no index/CSV) -------------------------------
+    try:
+        app_state.tm_agent = DeepseekTeachingInline(deepseek=app_state.deepseek_utils)
+        logging.info("Teaching methods inline agent ready ")
+    except Exception as e:
+        app_state.tm_agent = None
+        logging.warning(f"Teaching methods inline agent disabled: {e}")
+
     logging.info("API startup complete")
 
 def shutdown_event():
@@ -512,6 +522,44 @@ async def analyze_course(course: CourseDescription, request: Request):
             status_code=500,
             detail="Skill analysis failed - please try again"
         )
+        
+# --- Teaching methods (inline, no index/CSV) -------------------------------
+        
+class TeachingMethodsRequest(BaseModel):
+    text: str
+    top_n: int = 8
+
+class TeachingMethod(BaseModel):
+    method_name: str
+    category: str
+    evidence: str
+    why_use_it: str
+
+class TeachingMethodsResponse(BaseModel):
+    methods: List[TeachingMethod]
+    
+@app.post("/teaching-methods", response_model=TeachingMethodsResponse)
+async def teaching_methods(req: TeachingMethodsRequest):
+    if app_state.tm_agent is None:
+        raise HTTPException(status_code=503, detail="Teaching methods agent unavailable")
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Empty input")
+
+    try:
+        result = await app_state.tm_agent.recommend(req.text, top_k=req.top_n)
+        # Ensure schema cleanliness (trim long why_use_it, normalize empties)
+        cleaned = []
+        for m in result.get("methods", []):
+            cleaned.append({
+                "method_name": m.get("method_name", "").strip(),
+                "category": m.get("category", "").strip(),
+                "evidence": (m.get("evidence") or "").strip() or "Not in source",
+                "why_use_it": " ".join((m.get("why_use_it") or "").strip().split())[:600]
+            })
+        return TeachingMethodsResponse(methods=cleaned)
+    except Exception as e:
+        logging.error(f"/teaching-methods failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Teaching methods analysis failed")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
